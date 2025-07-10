@@ -23,6 +23,7 @@ import re
 from datetime import datetime
 import importlib
 import chardet
+import unicodedata
 
 # --- ユーティリティ読み込み & 強制リロード ---
 import utils.mapping_config as map_cfg
@@ -63,6 +64,8 @@ def normalize_titles(data, *args, **kwargs):
 
     if {'種別', '名称'} - set(df.columns):
         raise ValueError('必須列「種別」「名称」が不足しています')
+    
+    unknown_series = set()          # ★ 変換できなかったシリーズの一時保管
 
     def convert(row):
         kind = str(row['種別']).strip()
@@ -98,20 +101,49 @@ def normalize_titles(data, *args, **kwargs):
 
         # --- 同人（イベント名抽出）---------------------------
         if kind in {"同人", "電子同人"}:
+            clean_name = cp._TAG_RE.sub('', name).strip()
             # 例: ... (サンクリ2024)  /  (COMIC1☆25) ...
-            m = re.search(r"\(([^)]*(サンクリ|例大祭|COMIC|C\d+)[^)]*)\)", name, re.IGNORECASE)
+            m_evt = re.search(r"\(([^)]*(サンクリ|例大祭|COMIC|C\d+)[^)]*)\)", name, re.IGNORECASE)
 
-            if m:
-                event = m.group(1)                           # 例: C105, COMIC1☆25
+            if m_evt:
+                event = m_evt.group(1)  # 例: C105, COMIC1☆25
             else:
                 # 2) yyyy-mm-dd フォーマットを探す
-                d  = re.search(r"\d{4}-\d{2}-\d{2}", name)   # 例: 2025-06-18
-                event = d.group(0).replace('-', '') if d else "イベント不明"          # 3) 無ければ「不明」
+                d = re.search(r"\d{4}-\d{2}-\d{2}", clean_name)
+                event = d.group(0).replace('-', '') if d else "イベント不明"
+            
+            def _normalize_series(s: str) -> str:
+                # ① 全角ハイフン・長音・ダッシュ類 → 半角ハイフン
+                s = re.sub(r'[―ー−–－]', '-', s)
+                # ② ハイフン前後を空白に置換して“単語区切り”へ
+                s = s.replace('-', ' ')
+                # ③ 全角空白 → 半角空白、連続空白 → 1 個
+                s = unicodedata.normalize('NFKC', s)
+                s = re.sub(r'\s+', ' ', s).strip()
+                return s
 
-            info  = parse_comic_name(name)
+
+            # ③ シリーズ名＝最後の (…) を抽出
+            m_ser = re.search(r"\(([^()]+)\)(?!.*\([^()]*\))", clean_name)
+            series_raw = m_ser.group(1).strip() if m_ser else ""
+
+            series_norm = _normalize_series(series_raw)
+
+            series_short = map_cfg.SERIES_MAPPING.get(series_norm, series_norm)
+            if series_norm == series_short:
+                unknown_series.add(series_norm)
+
+            # ⑤ 作者・タイトル
+            info   = parse_comic_name(clean_name)
             author = info["author"] or ""
-            title  = info["title"]  or name
-            return f"{tag}[{author}]({event}){title}"
+            title  = info["title"] or clean_name
+            if series_raw:                          # タイトル末尾の (シリーズ名) を除去
+                title = re.sub(r'\s*\(' + re.escape(series_raw) + r'\)\s*$', '', title).strip()
+            
+            out = f"{tag}[{author}]({event}){title}"
+            if series_short:
+                out += f" ({series_short})"
+            return out
 
         # --- その他（マッピング ＋ クリップ）---------------
         for pattern, fmt in PATTERN_MAPPING.get(kind, []):
@@ -142,6 +174,22 @@ def normalize_titles(data, *args, **kwargs):
     df['変換後'] = df.apply(convert, axis=1)
     df['出力日時'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
+    # ★ 未登録シリーズを DataFrame 化（空なら行ゼロ）
+    log_df = pd.DataFrame({'未登録シリーズ候補': sorted(unknown_series)})
+
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     df.to_csv(output_path, sep='\t', index=False, encoding='shift_jis', errors='ignore')
-    return df[['種別', '名称', '変換後', '出力日時']]
+
+    # --- Unknown シリーズをログファイルへ ----------------------
+    if unknown_series:
+        log_dir  = os.path.dirname(output_path)
+        ts       = datetime.now().strftime('%Y%m%d-%H%M%S')
+        log_path = os.path.join(log_dir, f"unknown_series_{ts}.log")
+        with open(log_path, 'w', encoding='utf-8') as f:
+            for s in sorted(unknown_series):
+                f.write(s + '\n')
+        print(f"[LOG] 未登録シリーズ {len(unknown_series)} 件 → {log_path}")
+    else:
+        print('[LOG] 未登録シリーズはありません')
+
+    return [df[['種別', '名称', '変換後', '出力日時']], log_df]
