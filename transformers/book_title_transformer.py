@@ -67,12 +67,27 @@ def normalize_titles(data, *args, **kwargs):
     
     unknown_series = set()          # ★ 変換できなかったシリーズの一時保管
 
+    def _normalize_series(s: str) -> str:
+        # ① 全角ハイフン・長音・ダッシュ類 → 半角ハイフン
+        s = re.sub(r'[―ー−–－]', '-', s)
+        # ② ハイフン前後を空白に置換して“単語区切り”へ
+        s = s.replace('-', ' ')
+        # ③ 全角空白 → 半角空白、連続空白 → 1 個
+        s = unicodedata.normalize('NFKC', s)
+        s = re.sub(r'\s+', ' ', s).strip()
+        return s
+
     def convert(row):
         kind = str(row['種別']).strip()
         name = str(row['名称']).strip()
-        tag   = PREFIX_MAPPING.get(kind, '')  # 先頭に付与するタグ（無ければ空）
+        tag   = PREFIX_MAPPING.get(kind, 'def')  # 先頭に付与するタグ（無ければdef）
+
+        name_norm = _normalize_series(name)
 
         # ---（変換せずそのまま出力） ----
+        if tag in {"def"}:
+            return name
+        # --- 設定資料 ---------------------------------------
         if kind in {"その他", "小説"}:
             return f"{tag}{name}" if tag else name
         # --- 設定資料 ---------------------------------------
@@ -89,7 +104,6 @@ def normalize_titles(data, *args, **kwargs):
             info = parse_comic_name(name)
             title  = format_comic(info)
             return title
-
         # --- 成年 ------------------------------------------
         if kind in {"成年コミック", "電子成年コミック"}:
             info = parse_comic_name(name)
@@ -98,7 +112,6 @@ def normalize_titles(data, *args, **kwargs):
             today  = datetime.today().strftime("%y%m%d")
             fixed  = f"[出版社](20{today})"
             return f"{tag}[{author}]{fixed}{title}"
-
         # --- 同人（イベント名抽出）---------------------------
         if kind in {"同人", "電子同人"}:
             clean_name = cp._TAG_RE.sub('', name).strip()
@@ -111,27 +124,14 @@ def normalize_titles(data, *args, **kwargs):
                 # 2) yyyy-mm-dd フォーマットを探す
                 d = re.search(r"\d{4}-\d{2}-\d{2}", clean_name)
                 event = d.group(0).replace('-', '') if d else "イベント不明"
-            
-            def _normalize_series(s: str) -> str:
-                # ① 全角ハイフン・長音・ダッシュ類 → 半角ハイフン
-                s = re.sub(r'[―ー−–－]', '-', s)
-                # ② ハイフン前後を空白に置換して“単語区切り”へ
-                s = s.replace('-', ' ')
-                # ③ 全角空白 → 半角空白、連続空白 → 1 個
-                s = unicodedata.normalize('NFKC', s)
-                s = re.sub(r'\s+', ' ', s).strip()
-                return s
-
 
             # ③ シリーズ名＝最後の (…) を抽出
             m_ser = re.search(r"\(([^()]+)\)(?!.*\([^()]*\))", clean_name)
             series_raw = m_ser.group(1).strip() if m_ser else ""
 
-            series_norm = _normalize_series(series_raw)
-
-            series_short = map_cfg.SERIES_MAPPING.get(series_norm, series_norm)
-            if series_norm == series_short:
-                unknown_series.add(series_norm)
+            series_short = map_cfg.SERIES_MAPPING.get(series_raw, series_raw)
+            if series_raw == series_short:
+                unknown_series.add(series_raw)
 
             # ⑤ 作者・タイトル
             info   = parse_comic_name(clean_name)
